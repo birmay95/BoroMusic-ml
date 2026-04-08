@@ -1,18 +1,17 @@
 import os
 import numpy as np
-import pandas as pd
 import librosa
 import tensorflow as tf
 import logging
+import psycopg2
+from pgvector.psycopg2 import register_vector
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from joblib import load
-from cachetools import TTLCache
 from io import BytesIO
 
 app = FastAPI()
 
-DATASET_PATH = "music_db.csv"
 MODEL_PATH = "model.keras"
 
 SR = 44100           
@@ -23,22 +22,35 @@ HOP_LENGTH = 512
 TIME_STEPS = 457    
 
 ALLOWED_CONTENT_TYPES = ["audio/mpeg", "audio/wav"]
-MAX_FILE_SIZE_MB = 50
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5433")
+DB_NAME = os.getenv("DB_NAME", "music_platform")
+DB_USER = os.getenv("DB_USER", "mishail")
+DB_PASS = os.getenv("DB_PASS", "12348765")
 
 if not os.path.exists(MODEL_PATH):
     raise RuntimeError("The model file was not found!")
     
 model = tf.keras.models.load_model(MODEL_PATH)
 
-scaler_initialized = False
 try:
     scaler = load("scaler.joblib")  
-    scaler_initialized = True
 except FileNotFoundError:
     exit("scaler.joblib not found!")
 
-def extract_features(y: np.ndarray):
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("MusicEmotionAPI")
 
+def get_db_connection():
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS
+    )
+    register_vector(conn)
+    return conn
+
+def extract_features(y: np.ndarray):
+    """Преобразует временной ряд в массив мел-спектрограмм"""
     segment_samples = SEGMENT_DURATION * SR
     segments = [
         y[i:i+segment_samples] 
@@ -49,8 +61,7 @@ def extract_features(y: np.ndarray):
     mel_specs = []
     for seg in segments:
         S = librosa.feature.melspectrogram(
-            y=seg, sr=SR, n_mels=N_MELS, 
-            n_fft=N_FFT, hop_length=HOP_LENGTH
+            y=seg, sr=SR, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH
         )
         S_DB = librosa.power_to_db(S, ref=np.max)
         mel_specs.append(S_DB[:, :TIME_STEPS])
@@ -58,164 +69,164 @@ def extract_features(y: np.ndarray):
     return np.array(mel_specs)[..., np.newaxis]
 
 def predict_valence_arousal(y: np.ndarray):
-    
+    """Вычисляет характеристики через модель и выполняет обратное масштабирование"""
     features = extract_features(y)
-
     if len(features) == 0:
-        raise ValueError("Error: couldn't extract the signs")
+        raise ValueError("Error: couldn't extract the features")
 
     predictions = model.predict(features)
     valence, arousal = np.mean(predictions, axis=0)
 
     transformed_values = scaler.inverse_transform([[valence, arousal]])[0]
-    print(f"Reverse conversion: {transformed_values}")
-    valence, arousal = transformed_values
+    return transformed_values[0], transformed_values[1]
 
-    return valence, arousal
 
-recommendation_cache = TTLCache(maxsize=1000, ttl=300)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("MusicEmotionAPI")
-
-@app.post("/upload_track")
+@app.post("/api/v1/upload_track")
 async def upload_track(file: UploadFile = File(...), track_id: str = Form(...)):
+    logger.info(f"UploadTrack: File received {file.filename} with track_id={track_id}")
 
-    logger.info(f"File received {file.filename} with track_id={track_id}")
-
-    if not track_id:
-        raise HTTPException(status_code=400, detail="track_id is required")
-    if not track_id.isdigit():
-        raise HTTPException(400, "track_id must be a number.")
     if file.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(400, "Only MP3/WAV files are supported.")
-    
-    file.file.seek(0, 2)
-    file_size = file.file.tell()
-    file.file.seek(0)
-    if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-        raise HTTPException(413, f"Maximum file size is {MAX_FILE_SIZE_MB}MB")
+        raise HTTPException(400, detail="UploadTrackException: Only MP3/WAV files are supported.")
     
     try:
         audio_bytes = await file.read()
         buffer = BytesIO(audio_bytes)
-
         y, sr = librosa.load(buffer, sr=SR)
 
         valence, arousal = predict_valence_arousal(y)
+        mood_vector = np.array([valence, arousal])
 
-    except librosa.LibrosaError as e:
-        logger.error(f"Audio processing error: {str(e)}")
-        raise HTTPException(415, "Invalid audio file")
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO feature_vectors (id, track_id, mood_vector)
+                    VALUES (gen_random_uuid(), %s::uuid, %s)
+                    ON CONFLICT (track_id) 
+                    DO UPDATE SET mood_vector = EXCLUDED.mood_vector;
+                """, (track_id, mood_vector))
+            conn.commit()
 
+        return {"message": "Track vector added/updated", "valence": float(valence), "arousal": float(arousal)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
-    
-    finally:
-        buffer.close()
-        file.file.close()
+        logger.error(f"UploadTrackException: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"UploadTrackException: {str(e)}")
 
-    df = pd.read_csv(DATASET_PATH)
-    df.loc[len(df)] = {"track_id": track_id, "valence": valence, "arousal": arousal}
-    df.to_csv(DATASET_PATH, index=False)
-
-    return {"message": "Track added", "valence": float(valence), "arousal": float(arousal)}
-
-@app.post("/recommend")
-async def recommend(track_id: str = Form(...)):
-
-    logger.info(f"Received a recommendation request for the track: {track_id}")
-
-    df = pd.read_csv(DATASET_PATH)
-
-    if track_id not in df["track_id"].astype(str).values:
-        if track_id in recommendation_cache:
-            del recommendation_cache[track_id]
-            logger.warning(f"Removed orphaned track {track_id} from cache")
-        raise HTTPException(status_code=400, detail="Track not found")
-    
-    if track_id in recommendation_cache:
-        logger.info(f"Returning cached recommendations for {track_id}")
-        return recommendation_cache[track_id]
-
-    if track_id not in df["track_id"].astype(str).values:
-        raise HTTPException(status_code=400, detail="Track not found")
-
-    track = df[df["track_id"] == int(track_id)]
-
-    if track.empty:
-        raise HTTPException(status_code=400, detail="The track was not found in the database")
-
-    track_vec = np.array([track.iloc[0]["valence"], track.iloc[0]["arousal"]])
-
-    df["distance"] = df.apply(lambda row: np.linalg.norm(track_vec - np.array([row["valence"], row["arousal"]])), axis=1)
-    recommendations = df.sort_values("distance").iloc[1:6]
-
-    recommended_tracks = []
-    for _, row in recommendations.iterrows():
-        recommended_tracks.append({
-            "track_id": row["track_id"],
-            "valence": float(row["valence"]),
-            "arousal": float(row["arousal"])
-        })
-    recommendation_cache[track_id] = {"recommendations": recommended_tracks}
-    return {"recommendations": recommended_tracks}
-
-class TrackDeleteRequest(BaseModel):
+class RecommendRequest(BaseModel):
     track_id: str
+    excluded_ids: list[str] = []
 
-@app.post("/delete_track")
-async def delete_track(request: TrackDeleteRequest):
+@app.post("/api/v1/recommend")
+async def recommend(request: RecommendRequest):
+    logger.info(f"Recommend: Request for track={request.track_id}, excluded={len(request.excluded_ids)}")
 
-    track_id = request.track_id
-    logger.info(f"Request to delete a track: {track_id}")
-    
     try:
-        if track_id in recommendation_cache:
-            del recommendation_cache[track_id]
-            logger.info(f"Track {track_id} removed from cache")
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT mood_vector FROM feature_vectors WHERE track_id = %s::uuid", (request.track_id,))
+                res = cur.fetchone()
+                
+                if not res or res[0] is None:
+                    logger.error(f"TrackFeatureNotFoundException: target track {request.track_id} not found")
+                    raise HTTPException(404, detail="TrackFeatureNotFoundException: Vector not found")
+                
+                target_vector = res[0]
 
-        df = pd.read_csv(DATASET_PATH)
-        
-        if track_id not in df["track_id"].astype(str).values:
-            raise HTTPException(
-                status_code=404,
-                detail="The track was not found in the database"
-            )
-            
-        initial_count = len(df)
-        df = df[df["track_id"].astype(str) != track_id]
-        
-        if len(df) == initial_count:
-            raise HTTPException(
-                status_code=500,
-                detail="Error when deleting a track"
-            )
-            
-        df.to_csv(DATASET_PATH, index=False)
-        logger.info(f"Track {track_id} successfully deleted")
-        
-        return {
-            "message": "The track was deleted successfully",
-            "deleted_track_id": track_id
-        }
-        
-    except pd.errors.EmptyDataError:
-        logger.error("The database is empty or corrupted")
-        raise HTTPException(
-            status_code=500,
-            detail="Database reading error"
-        )
-        
+                query = """
+                    SELECT track_id, mood_vector
+                    FROM feature_vectors
+                    WHERE track_id != %s::uuid AND mood_vector IS NOT NULL
+                """
+                params = [request.track_id]
+
+                if request.excluded_ids:
+                    query += " AND track_id != ALL(%s::uuid[]) "
+                    params.append(request.excluded_ids)
+
+                query += " ORDER BY mood_vector <-> %s LIMIT 5 "
+                params.append(target_vector)
+
+                cur.execute(query, tuple(params))
+
+                recommendations = [
+                    {"track_id": str(row[0]), "valence": float(row[1][0]), "arousal": float(row[1][1])}
+                    for row in cur.fetchall()
+                ]
+        return {"recommendations": recommendations}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"DB Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+class PersonalRecommendRequest(BaseModel):
+    liked_track_ids: list[str] = Field(default=[], max_length=50)
+    excluded_ids: list[str] = []
+
+@app.post("/api/v1/recommend/personal")
+async def recommend_personal(request: PersonalRecommendRequest):
+    logger.info(f"PersonalFeed: liked={len(request.liked_track_ids)}, excluded={len(request.excluded_ids)}")
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                
+                centroid = None
+                
+                if not request.liked_track_ids:
+                    logger.warning("UserPreferencesNotFoundException: liked list is empty. Fallback to center.")
+                    centroid = np.array([5.0, 5.0])
+                else:
+                    cur.execute("""
+                        SELECT mood_vector FROM feature_vectors 
+                        WHERE track_id = ANY(%s::uuid[]) AND mood_vector IS NOT NULL
+                    """, (request.liked_track_ids,))
+                    
+                    rows = cur.fetchall()
+                    if rows:
+                        vectors = [row[0] for row in rows]
+                        centroid = np.mean(vectors, axis=0)
+                        logger.info(f"Taste centroid calculated: {centroid}")
+                    else:
+                        logger.warning("UserPreferencesNotFoundException: valid vectors not found. Fallback to center.")
+                        centroid = np.array([5.0, 5.0])
+
+                query = """
+                    SELECT track_id, mood_vector
+                    FROM feature_vectors
+                    WHERE mood_vector IS NOT NULL
+                """
+                params = []
+
+                if request.excluded_ids:
+                    query += " AND track_id != ALL(%s::uuid[]) "
+                    params.append(request.excluded_ids)
+
+                query += " ORDER BY mood_vector <-> %s LIMIT 30 "
+                params.append(centroid)
+
+                cur.execute(query, tuple(params))
+
+                recommendations = [
+                    {"track_id": str(row[0]), "valence": float(row[1][0]), "arousal": float(row[1][1])}
+                    for row in cur.fetchall()
+                ]
+        return {"recommendations": recommendations}
+    except Exception as e:
+        logger.error(f"DB Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+@app.delete("/api/v1/delete_track/{track_id}")
+async def delete_track(track_id: str):
+    logger.info(f"DeleteTrack: Request to delete features for track {track_id}")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM feature_vectors WHERE track_id = %s::uuid", (track_id,))
+            conn.commit()
+        return {"message": f"The features for track {track_id} were deleted successfully"}
     except Exception as e:
         logger.error(f"Error when deleting: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error"
-        )
+        raise HTTPException(status_code=500, detail="Internal server error during deletion")
 
 if __name__ == "__main__":
     import uvicorn
