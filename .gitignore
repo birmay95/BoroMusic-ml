@@ -16,3 +16,5 @@ first_model_with_torch/
 
 dataset1.csv
 dataset2.csv
+
+processed_spectrograms/

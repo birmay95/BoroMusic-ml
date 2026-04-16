@@ -184,8 +184,14 @@ async def recommend_personal(request: PersonalRecommendRequest):
                     rows = cur.fetchall()
                     if rows:
                         vectors = [row[0] for row in rows]
+                        
+                        logger.info(f"Retrieved {len(vectors)} valid mood vectors from user history.")
+                        logger.info("Calculating arithmetic mean of coordinates for Valence and Arousal axes...")
+                        
                         centroid = np.mean(vectors, axis=0)
-                        logger.info(f"Taste centroid calculated: {centroid}")
+                        
+                        logger.info(f"Taste centroid successfully generated: Valence={centroid[0]:.4f}, Arousal={centroid[1]:.4f}")
+                        # -----------------------------------------------
                     else:
                         logger.warning("UserPreferencesNotFoundException: valid vectors not found. Fallback to center.")
                         centroid = np.array([5.0, 5.0])
