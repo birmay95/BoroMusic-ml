@@ -1,4 +1,5 @@
 import os
+import math
 import numpy as np
 import librosa
 import tensorflow as tf
@@ -14,12 +15,15 @@ app = FastAPI()
 
 MODEL_PATH = "model.keras"
 
-SR = 44100           
+SR = 22050           
 SEGMENT_DURATION = 5 
-N_MELS = 64         
+N_MELS = 128         
 N_FFT = 2048        
 HOP_LENGTH = 512    
-TIME_STEPS = 457    
+TIME_STEPS = math.ceil((SEGMENT_DURATION * SR) / HOP_LENGTH)    
+
+MODEL_PATH = "rgb-model-dyn/model_rgb.keras"
+SCALER_PATH = "rgb-model-dyn/scaler_rgb.joblib"
 
 ALLOWED_CONTENT_TYPES = ["audio/mpeg", "audio/wav"]
 
@@ -30,14 +34,14 @@ DB_USER = os.getenv("DB_USER", "mishail")
 DB_PASS = os.getenv("DB_PASS", "12348765")
 
 if not os.path.exists(MODEL_PATH):
-    raise RuntimeError("The model file was not found!")
+    raise RuntimeError(f"The model file {MODEL_PATH} was not found!")
     
 model = tf.keras.models.load_model(MODEL_PATH)
 
 try:
-    scaler = load("scaler.joblib")  
+    scaler = load(SCALER_PATH)  
 except FileNotFoundError:
-    exit("scaler.joblib not found!")
+    exit(f"{SCALER_PATH} not found!")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MusicEmotionAPI")
@@ -50,23 +54,38 @@ def get_db_connection():
     return conn
 
 def extract_features(y: np.ndarray):
-    """Преобразует временной ряд в массив мел-спектрограмм"""
+    """Преобразует временной ряд в массив 3-канальных динамических спектрограмм"""
     segment_samples = SEGMENT_DURATION * SR
+    
     segments = [
         y[i:i+segment_samples] 
         for i in range(0, len(y), segment_samples)
         if len(y[i:i+segment_samples]) == segment_samples
     ]
     
-    mel_specs = []
+    acoustic_features = []
+    
     for seg in segments:
-        S = librosa.feature.melspectrogram(
-            y=seg, sr=SR, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH
-        )
-        S_DB = librosa.power_to_db(S, ref=np.max)
-        mel_specs.append(S_DB[:, :TIME_STEPS])
+        S = librosa.feature.melspectrogram(y=seg, sr=SR, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH)
+        mel_db = librosa.power_to_db(S, ref=np.max)
         
-    return np.array(mel_specs)[..., np.newaxis]
+        mel_delta = librosa.feature.delta(mel_db)
+        
+        mel_delta2 = librosa.feature.delta(mel_db, order=2)
+        
+        mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
+        delta_norm = (mel_delta - mel_delta.min()) / (mel_delta.max() - mel_delta.min() + 1e-8)
+        delta2_norm = (mel_delta2 - mel_delta2.min()) / (mel_delta2.max() - mel_delta2.min() + 1e-8)
+        
+        if mel_norm.shape[1] >= TIME_STEPS:
+            mel_norm = mel_norm[:, :TIME_STEPS]
+            delta_norm = delta_norm[:, :TIME_STEPS]
+            delta2_norm = delta2_norm[:, :TIME_STEPS]
+            
+            dynamic_rgb = np.stack([mel_norm, delta_norm, delta2_norm], axis=-1)
+            acoustic_features.append(dynamic_rgb)
+            
+    return np.array(acoustic_features)
 
 def predict_valence_arousal(y: np.ndarray):
     """Вычисляет характеристики через модель и выполняет обратное масштабирование"""
