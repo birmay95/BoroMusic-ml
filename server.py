@@ -1,4 +1,6 @@
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import math
 import numpy as np
 import librosa
@@ -54,7 +56,7 @@ def get_db_connection():
     return conn
 
 def extract_features(y: np.ndarray):
-    """Преобразует временной ряд в массив 3-канальных динамических спектрограмм"""
+    logger.info("[ML-ENGINE] Initializing audio feature extraction pipeline...")
     segment_samples = SEGMENT_DURATION * SR
     
     segments = [
@@ -62,6 +64,7 @@ def extract_features(y: np.ndarray):
         for i in range(0, len(y), segment_samples)
         if len(y[i:i+segment_samples]) == segment_samples
     ]
+    logger.info(f"[ML-ENGINE] Sliced audio into {len(segments)} segments of 5 seconds.")
     
     acoustic_features = []
     
@@ -85,20 +88,27 @@ def extract_features(y: np.ndarray):
             dynamic_rgb = np.stack([mel_norm, delta_norm, delta2_norm], axis=-1)
             acoustic_features.append(dynamic_rgb)
             
-    return np.array(acoustic_features)
+    features_tensor = np.array(acoustic_features)
+    logger.info(f"[ML-ENGINE] Tensor generated successfully. Final shape: {features_tensor.shape} (Batch, Height, Width, Channels)")
+    return features_tensor
 
 def predict_valence_arousal(y: np.ndarray):
-    """Вычисляет характеристики через модель и выполняет обратное масштабирование"""
+    logger.info("[ML-ENGINE] Starting Convolutional Neural Network prediction...")
     features = extract_features(y)
     if len(features) == 0:
         raise ValueError("Error: couldn't extract the features")
 
-    predictions = model.predict(features)
-    valence, arousal = np.mean(predictions, axis=0)
+    predictions = model.predict(features, verbose=0)
+    valence_raw, arousal_raw = np.mean(predictions, axis=0)
 
-    transformed_values = scaler.inverse_transform([[valence, arousal]])[0]
-    return transformed_values[0], transformed_values[1]
+    logger.info(f"[ML-DEBUG] RAW Keras Output -> V: {valence_raw:.4f}, A: {arousal_raw:.4f}")
 
+    final_valence = (valence_raw * 8.0) + 1.0
+    final_arousal = (arousal_raw * 8.0) + 1.0
+
+    logger.info(f"[ML-ENGINE] Final Output (1-9 scale) -> V: {final_valence:.4f}, A: {final_arousal:.4f}")
+    
+    return float(final_valence), float(final_arousal)
 
 @app.post("/api/v1/upload_track")
 async def upload_track(file: UploadFile = File(...), track_id: str = Form(...)):
@@ -183,7 +193,7 @@ class PersonalRecommendRequest(BaseModel):
 
 @app.post("/api/v1/recommend/personal")
 async def recommend_personal(request: PersonalRecommendRequest):
-    logger.info(f"PersonalFeed: liked={len(request.liked_track_ids)}, excluded={len(request.excluded_ids)}")
+    logger.info(f"[API-REC] Generating Personal Feed. Liked history size: {len(request.liked_track_ids)}")
 
     try:
         with get_db_connection() as conn:
@@ -192,7 +202,7 @@ async def recommend_personal(request: PersonalRecommendRequest):
                 centroid = None
                 
                 if not request.liked_track_ids:
-                    logger.warning("UserPreferencesNotFoundException: liked list is empty. Fallback to center.")
+                    logger.warning("[API-REC] Empty user history. Generating neutral centroid.")
                     centroid = np.array([5.0, 5.0])
                 else:
                     cur.execute("""
@@ -204,17 +214,16 @@ async def recommend_personal(request: PersonalRecommendRequest):
                     if rows:
                         vectors = [row[0] for row in rows]
                         
-                        logger.info(f"Retrieved {len(vectors)} valid mood vectors from user history.")
-                        logger.info("Calculating arithmetic mean of coordinates for Valence and Arousal axes...")
+                        logger.info(f"[ML-MATH] Calculating arithmetic mean across {len(vectors)} vectors in Valence-Arousal plane...")
                         
                         centroid = np.mean(vectors, axis=0)
                         
-                        logger.info(f"Taste centroid successfully generated: Valence={centroid[0]:.4f}, Arousal={centroid[1]:.4f}")
-                        # -----------------------------------------------
+                        logger.info(f"[ML-MATH] Taste Centroid calculated -> [V: {centroid[0]:.3f}, A: {centroid[1]:.3f}]")
                     else:
                         logger.warning("UserPreferencesNotFoundException: valid vectors not found. Fallback to center.")
                         centroid = np.array([5.0, 5.0])
 
+                logger.info(f"[PGVECTOR] Executing '<->' cosine distance search in PostgreSQL...")
                 query = """
                     SELECT track_id, mood_vector
                     FROM feature_vectors
@@ -235,6 +244,7 @@ async def recommend_personal(request: PersonalRecommendRequest):
                     {"track_id": str(row[0]), "valence": float(row[1][0]), "arousal": float(row[1][1])}
                     for row in cur.fetchall()
                 ]
+                logger.info(f"[PGVECTOR] Search complete. Returning {len(recommendations)} nearest neighbor tracks.")
         return {"recommendations": recommendations}
     except Exception as e:
         logger.error(f"DB Error: {str(e)}")
